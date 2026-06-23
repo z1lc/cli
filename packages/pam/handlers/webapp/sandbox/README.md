@@ -20,7 +20,7 @@ TARGET_URL ─► chromium --kiosk ─► Xvfb :0 ──XDamage──► freerdp
 - **RDP server: `freerdp-shadow-cli`** (from `freerdp2-shadow-x11`), mirroring an
   Xvfb display via XDamage and injecting input via XTEST. This is the server the
   M0 spike proved compatible with the bridge — see
-  [`docs/completed/m0.md`](../../../docs/completed/m0.md). We kept it deliberately
+  [`docs/completed/m0.md`](../../../../../../docs/completed/m0.md). We kept it deliberately
   rather than re-evaluating (e.g. weston's RDP backend) in isolation.
 - **Security: TLS, no NLA** (`/sec:tls`). The bridge's connector requests
   `SSL|HYBRID|HYBRID_EX` and settles on plain `SSL` (no CredSSP), so the server
@@ -29,7 +29,7 @@ TARGET_URL ─► chromium --kiosk ─► Xvfb :0 ──XDamage──► freerdp
 ## Build
 
 ```bash
-docker build -t infisical-pam-webapp-sandbox:dev cli/docker/pam-webapp-sandbox/
+docker build -t infisical-pam-webapp-sandbox:dev cli/packages/pam/handlers/webapp/sandbox/
 ```
 
 On Apple Silicon this builds a native `linux/arm64` image. Release builds the
