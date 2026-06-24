@@ -22,6 +22,7 @@ import (
 	"github.com/Infisical/infisical-merge/packages/pam/handlers/rdp"
 	"github.com/Infisical/infisical-merge/packages/pam/handlers/redis"
 	"github.com/Infisical/infisical-merge/packages/pam/handlers/ssh"
+	"github.com/Infisical/infisical-merge/packages/pam/handlers/webapp"
 	"github.com/Infisical/infisical-merge/packages/pam/session"
 	"github.com/Infisical/infisical-merge/packages/util"
 	"github.com/go-resty/resty/v2"
@@ -40,6 +41,14 @@ type GatewayPAMConfig struct {
 	SessionUploader    *session.SessionUploader
 	GetMongoProxy      MongoProxyGetter // Session-level MongoDB proxy sharing
 	OnActivity         func()           // Called on data flow
+
+	// Webapp resources only (no TCP host/port). The gateway launches a sandboxed
+	// browser container navigated to WebAppTargetURL and streams its local RDP
+	// server. Domain scope is carried for M5/M6 (CDP scope + egress lock) and is
+	// not yet enforced in M3.
+	WebAppTargetURL         string
+	WebAppDomainScope       string
+	WebAppIncludeSubdomains bool
 }
 
 type PAMCapabilitiesResponse struct {
@@ -63,6 +72,12 @@ func GetSupportedResourceTypes() []string {
 	// session at connect time with ErrRdpUnavailable.
 	if rdp.IsSupported() {
 		types = append(types, session.ResourceTypeWindows)
+	}
+	// Webapp streams over the same RDP bridge (needs rdp.IsSupported) AND requires
+	// a container runtime to launch the per-session sandbox. Gate on both so a
+	// gateway without Docker doesn't advertise webapp and then fail at launch.
+	if rdp.IsSupported() && webapp.IsSupported() {
+		types = append(types, session.ResourceTypeWebApp)
 	}
 	return types
 }
@@ -492,6 +507,40 @@ func HandlePAMProxy(ctx context.Context, conn *tls.Conn, pamConfig *GatewayPAMCo
 			return proxy.HandleConnectionRDCleanPath(ctx, handlerConn)
 		}
 		return proxy.HandleConnection(ctx, handlerConn)
+	case session.ResourceTypeWebApp:
+		if pamConfig.WebAppTargetURL == "" {
+			return fmt.Errorf("webapp: session has no target URL")
+		}
+		// Launch a per-session sandbox container navigated to the target URL and
+		// wait for its local RDP server. The container is torn down on EVERY exit
+		// path below — normal end, expiry-timer conn.Close (the goroutine above),
+		// ctx cancellation, and errors — by the deferred Close. Leaked containers
+		// are the top operational hazard, so this defer is load-bearing.
+		sandbox, err := webapp.Launch(ctx, pamConfig.SessionId, pamConfig.WebAppTargetURL)
+		if err != nil {
+			return fmt.Errorf("webapp: launch sandbox container: %w", err)
+		}
+		defer sandbox.Close()
+
+		rdpConfig := rdp.RDPProxyConfig{
+			TargetHost: sandbox.Host,
+			TargetPort: sandbox.Port,
+			// No injected credentials: the sandbox RDP server is TLS-only (no NLA),
+			// so the bridge performs no CredSSP. The browser presents the fixed
+			// rdp.BrowserAcceptorUsername the container's permissive PAM accepts.
+			SessionID:       pamConfig.SessionId,
+			SessionLogger:   sessionLogger,
+			PriorElapsedNs:  pamConfig.SessionUploader.GetPriorElapsedNs(pamConfig.SessionId),
+			SessionUploader: pamConfig.SessionUploader,
+		}
+		proxy := rdp.NewRDPProxy(rdpConfig)
+		log.Info().
+			Str("sessionId", pamConfig.SessionId).
+			Str("target", fmt.Sprintf("%s:%d", sandbox.Host, sandbox.Port)).
+			Str("targetUrl", pamConfig.WebAppTargetURL).
+			Msg("Starting webapp PAM proxy")
+		// Webapp is always the browser RDP (RDCleanPath) flow.
+		return proxy.HandleConnectionRDCleanPath(ctx, handlerConn)
 	default:
 		return fmt.Errorf("unsupported resource type: %s", pamConfig.ResourceType)
 	}

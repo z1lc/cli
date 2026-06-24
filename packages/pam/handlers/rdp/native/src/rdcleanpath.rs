@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use bytes::BytesMut;
 use ironrdp_acceptor::{Acceptor, DesktopSize as AcceptorDesktopSize};
 use ironrdp_connector::{ClientConnector, Sequence};
-use ironrdp_core::{encode_buf, WriteBuf};
+use ironrdp_core::{decode, encode_buf, WriteBuf};
 use ironrdp_pdu::nego::{
     ConnectionConfirm, ConnectionRequest, RequestFlags, ResponseFlags, SecurityProtocol,
 };
@@ -73,9 +73,18 @@ async fn run_mitm_rdcleanpath_inner(
     };
     info!(destination, "RDCleanPath: received Request");
 
+    eprintln!(
+        "[rdp-bridge] DIAG: extracted {}-byte client X.224 CR: {:02x?}",
+        x224_cr.len(),
+        &x224_cr
+    );
     let target_tcp = TcpStream::connect((target.host.as_str(), target.port))
         .await
         .with_context(|| format!("connect target {}:{}", target.host, target.port))?;
+    eprintln!(
+        "[rdp-bridge] DIAG: connected to target {}:{}",
+        target.host, target.port
+    );
     let target_addr = target_tcp.local_addr().context("local_addr")?;
     let mut target_framed = TokioFramed::new(target_tcp);
 
@@ -83,9 +92,29 @@ async fn run_mitm_rdcleanpath_inner(
         .write_all(&x224_cr)
         .await
         .context("write X.224 CR to target")?;
+    eprintln!("[rdp-bridge] DIAG: wrote CR to target, reading CC...");
     let x224_cc_target = read_tpkt_pdu(&mut target_framed)
         .await
         .context("read X.224 CC")?;
+    eprintln!(
+        "[rdp-bridge] DIAG: read {}-byte CC from target: {:02x?}",
+        x224_cc_target.len(),
+        &x224_cc_target
+    );
+
+    // The target validates that the client's MCS Connect Initial echoes the
+    // protocol the target itself selected here. Decode it now so the MCS filter
+    // can rewrite the (acceptor-negotiated) echo to the target's actual choice —
+    // HYBRID_EX for Windows, plain SSL for the TLS-only webapp container.
+    let target_selected_protocol = match decode::<X224<ConnectionConfirm>>(&x224_cc_target)
+        .map_err(|e| anyhow!("decode target X.224 CC: {e:?}"))?
+        .0
+    {
+        ConnectionConfirm::Response { protocol, .. } => protocol,
+        ConnectionConfirm::Failure { code } => {
+            anyhow::bail!("target X.224 negotiation failure: {code:?}")
+        }
+    };
 
     let (initial_stream, target_leftover) = target_framed.into_inner();
     let (upgraded_stream, target_cert) = ironrdp_tls::upgrade(initial_stream, &target.host)
@@ -217,9 +246,14 @@ async fn run_mitm_rdcleanpath_inner(
     let (mut client_stream, client_lo) = client_framed.into_inner();
     let (mut target_stream, target_lo) = target_framed.into_inner();
 
-    filter_client_mcs_connect_initial(&mut client_stream, &mut target_stream, client_lo)
-        .await
-        .context("filter client MCS Connect Initial")?;
+    filter_client_mcs_connect_initial(
+        &mut client_stream,
+        &mut target_stream,
+        client_lo,
+        target_selected_protocol,
+    )
+    .await
+    .context("filter client MCS Connect Initial")?;
 
     if !target_lo.is_empty() {
         client_stream

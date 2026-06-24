@@ -399,6 +399,11 @@ pub extern "C" fn rdp_bridge_wait(handle: u64) -> i32 {
             }
             Ok(Err(e)) => {
                 error!(handle, error = ?e, "rdp_bridge_wait: session failed");
+                // The detailed anyhow context chain is otherwise lost across the
+                // FFI boundary (Go only sees RDP_BRIDGE_SESSION_ERROR). Surface it
+                // to stderr so a failed session's real cause is visible in the
+                // gateway output without a tracing subscriber.
+                eprintln!("[rdp-bridge] session {handle} failed: {e:#}");
                 RDP_BRIDGE_SESSION_ERROR
             }
             Err(_) => {
