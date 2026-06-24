@@ -87,11 +87,16 @@ async fn run_mitm_native_inner(
     )?;
 
     let (mut client_stream, client_leftover) = acceptor_output;
-    let (mut target_stream, target_leftover) = connector_output;
+    let (mut target_stream, target_leftover, target_selected_protocol) = connector_output;
 
-    filter_client_mcs_connect_initial(&mut client_stream, &mut target_stream, client_leftover)
-        .await
-        .context("filter client MCS Connect Initial")?;
+    filter_client_mcs_connect_initial(
+        &mut client_stream,
+        &mut target_stream,
+        client_leftover,
+        target_selected_protocol,
+    )
+    .await
+    .context("filter client MCS Connect Initial")?;
 
     if !target_leftover.is_empty() {
         client_stream
@@ -505,14 +510,21 @@ fn decode_fast_path_input(frame: &[u8]) -> anyhow::Result<FastPathInput> {
 }
 
 // Decode + mutate + re-encode the client's MCS Connect Initial:
-//   - set CS_CORE.serverSelectedProtocol to HYBRID_EX (FreeRDP echoes the
-//     wrong value, and target servers reject mismatched echoes)
+//   - set CS_CORE.serverSelectedProtocol to the protocol the *target* selected
+//     during the connector half's X.224 negotiation. The acceptor half ran its
+//     own X.224 with the client, so the client (FreeRDP/IronRDP) echoes the
+//     acceptor-selected value here — but the target validates this field against
+//     the protocol *it* selected, and rejects a mismatch. Windows targets select
+//     HYBRID_EX; a TLS-only Linux/container RDP server (the webapp sandbox)
+//     selects plain SSL. Echoing a hardcoded value only works for one of them,
+//     so we forward the connector's actual negotiated protocol.
 //   - clear CS_NET.channels so the target doesn't try to open virtual
 //     channels (clipboard, drives, audio, USB) the bridge can't service
 pub(crate) async fn filter_client_mcs_connect_initial(
     client_stream: &mut ErasedStream,
     target_stream: &mut ErasedStream,
     leftover: bytes::BytesMut,
+    target_selected_protocol: SecurityProtocol,
 ) -> Result<()> {
     let mut buf: Vec<u8> = leftover.to_vec();
 
@@ -554,7 +566,7 @@ pub(crate) async fn filter_client_mcs_connect_initial(
         .map_err(|e| anyhow::anyhow!("decode MCS Connect Initial: {e:?}"))?;
 
     let mut gcc_blocks = connect_initial.conference_create_request.into_gcc_blocks();
-    gcc_blocks.core.optional_data.server_selected_protocol = Some(SecurityProtocol::HYBRID_EX);
+    gcc_blocks.core.optional_data.server_selected_protocol = Some(target_selected_protocol);
     if let Some(network) = gcc_blocks.network.as_mut() {
         network.channels.clear();
     }
@@ -642,7 +654,9 @@ async fn run_acceptor_half(
     Ok(acceptor_framed.into_inner())
 }
 
-async fn run_connector_half(target: TargetEndpoint) -> Result<(ErasedStream, bytes::BytesMut)> {
+async fn run_connector_half(
+    target: TargetEndpoint,
+) -> Result<(ErasedStream, bytes::BytesMut, SecurityProtocol)> {
     let target_addr = format!("{}:{}", target.host, target.port);
     let target_tcp = TcpStream::connect(&target_addr)
         .await
@@ -661,7 +675,7 @@ async fn run_connector_half(target: TargetEndpoint) -> Result<(ErasedStream, byt
     // ServerCoreData.clientRequestedProtocols echo matches what they expect.
     let request_set =
         SecurityProtocol::HYBRID_EX | SecurityProtocol::HYBRID | SecurityProtocol::SSL;
-    connector_x224_with_protocol(&mut target_framed, &mut connector, request_set)
+    let selected_protocol = connector_x224_with_protocol(&mut target_framed, &mut connector, request_set)
         .await
         .context("connector: X.224 init")?;
 
@@ -692,7 +706,8 @@ async fn run_connector_half(target: TargetEndpoint) -> Result<(ErasedStream, byt
     }
     info!("connector: CredSSP complete, credential injection succeeded");
 
-    Ok(target_framed.into_inner())
+    let (stream, leftover) = target_framed.into_inner();
+    Ok((stream, leftover, selected_protocol))
 }
 
 // Drive the X.224 negotiation with the caller-chosen protocol set, then
@@ -704,7 +719,7 @@ async fn connector_x224_with_protocol<S>(
     framed: &mut ironrdp_tokio::TokioFramed<S>,
     connector: &mut ClientConnector,
     requested: SecurityProtocol,
-) -> Result<()>
+) -> Result<SecurityProtocol>
 where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
@@ -757,7 +772,7 @@ where
     }
 
     connector.state = ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol };
-    Ok(())
+    Ok(selected_protocol)
 }
 
 // Replicated from ironrdp-async's private perform_credssp_step so we can

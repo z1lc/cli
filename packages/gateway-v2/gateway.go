@@ -20,6 +20,7 @@ import (
 	"github.com/Infisical/infisical-merge/packages/api"
 	"github.com/Infisical/infisical-merge/packages/pam"
 	"github.com/Infisical/infisical-merge/packages/pam/handlers/mongodb"
+	"github.com/Infisical/infisical-merge/packages/pam/handlers/webapp"
 	"github.com/Infisical/infisical-merge/packages/pam/session"
 	"github.com/Infisical/infisical-merge/packages/systemd"
 	"github.com/Infisical/infisical-merge/packages/util"
@@ -75,6 +76,21 @@ type RoutingInfo struct {
 type PAMInfo struct {
 	SessionId    string `json:"sessionId"`
 	ResourceType string `json:"resourceType"`
+	// Set only for webapp resources, which have no TCP host/port. The gateway
+	// launches a sandboxed browser container navigated to TargetURL and streams
+	// its local RDP server over the same RDP-browser path as Windows. DomainScope
+	// rides along for M5/M6 (CDP navigation scope + egress lock).
+	WebApp *WebAppInfo `json:"webApp,omitempty"`
+}
+
+type WebAppInfo struct {
+	TargetURL   string            `json:"targetUrl"`
+	DomainScope WebAppDomainScope `json:"domainScope"`
+}
+
+type WebAppDomainScope struct {
+	Domain            string `json:"domain"`
+	IncludeSubdomains bool   `json:"includeSubdomains"`
 }
 
 type ActorDetails struct {
@@ -428,6 +444,10 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 	// Start session uploader goroutine for PAM
 	g.pamSessionUploader.Start()
+
+	// Sweep any webapp sandbox containers orphaned by a previous gateway process
+	// (e.g. a crash that skipped the in-session teardown). Best-effort, bounded.
+	go webapp.CleanupOrphans(ctx)
 
 	go g.startIdleReaper(ctx)
 
@@ -873,7 +893,8 @@ func (g *Gateway) handleIncomingChannel(newChannel ssh.NewChannel) {
 	} else if forwardConfig.Mode == ForwardModePAM || forwardConfig.Mode == ForwardModePAMRDPBrowser {
 		// RDP only: prior bridge must fully tear down before the new one starts,
 		// else overlapping drains write non-monotonic elapsedMs to the recording.
-		if forwardConfig.PAMConfig.ResourceType == session.ResourceTypeWindows {
+		if forwardConfig.PAMConfig.ResourceType == session.ResourceTypeWindows ||
+			forwardConfig.PAMConfig.ResourceType == session.ResourceTypeWebApp {
 			g.evictExistingPAMSessions(forwardConfig.PAMConfig.SessionId, 5*time.Second)
 		}
 		sessionCtx, sessionCancel := context.WithCancel(g.ctx)
@@ -1062,6 +1083,11 @@ func (g *Gateway) parseDetailsFromCertificate(tlsConn *tls.Conn, config *Forward
 				CredentialsManager: g.pamCredentialsManager,
 				SessionUploader:    g.pamSessionUploader,
 				GetMongoProxy:      g.GetOrCreateMongoProxy,
+			}
+			if pamInfo.WebApp != nil {
+				config.PAMConfig.WebAppTargetURL = pamInfo.WebApp.TargetURL
+				config.PAMConfig.WebAppDomainScope = pamInfo.WebApp.DomainScope.Domain
+				config.PAMConfig.WebAppIncludeSubdomains = pamInfo.WebApp.DomainScope.IncludeSubdomains
 			}
 		}
 	}
